@@ -4,3 +4,4 @@ yfinance
 feedparser
 numpy
 plotly
+pandas_market_calendars

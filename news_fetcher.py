@@ -1,4 +1,5 @@
 import feedparser
+import requests
 from urllib.parse import quote
 from datetime import timedelta
 
@@ -26,7 +27,12 @@ def fetch_extreme_move_news(ticker, start_date, end_date):
     encoded_query = quote(query)
     url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
     
-    feed = feedparser.parse(url)
+    try:
+        response = requests.get(url, timeout=10)
+        feed = feedparser.parse(response.content)
+    except Exception as e:
+        print(f"Error fetching news: {e}")
+        return []
     
     if not feed.entries:
         return []

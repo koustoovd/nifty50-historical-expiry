@@ -22,15 +22,22 @@ def get_indices_tickers():
     return {
         "NIFTY 50": "^NSEI",
         "BANKNIFTY": "^NSEBANK",
-        "SENSEX": "^BSESN"
+        "SENSEX": "^BSESN",
+        "FINNIFTY": "^CNXFIN",
+        "MIDCPNIFTY": "^MIDCPNIFTY"
     }
 
-def fetch_historical_data(ticker, years=5):
+def fetch_historical_data(ticker, start_date=None, end_date=None, years=None):
     """
-    Fetches daily historical data for the given ticker for the past `years`.
+    Fetches daily historical data for the given ticker.
+    Supports explicit start_date/end_date (datetime) OR a default lookback if years is passed.
     """
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=years * 365 + 30) # Add buffer for rolling stats
+    if start_date is None or end_date is None:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=(years if years else 5) * 365 + 30)
+    else:
+        # Buffer before start_date to allow rolling stats calculation
+        start_date = start_date - timedelta(days=30)
     
     data = yf.download(ticker, start=start_date, end=end_date)
     # yf.download sometimes returns MultiIndex columns if a single ticker is passed as list or depending on version.
@@ -39,6 +46,6 @@ def fetch_historical_data(ticker, years=5):
         
     return data
 
-def fetch_india_vix(years=5):
+def fetch_india_vix(start_date=None, end_date=None, years=None):
     """Fetches INDIAVIX historical data."""
-    return fetch_historical_data("^INDIAVIX", years=years)
+    return fetch_historical_data("^INDIAVIX", start_date, end_date, years)
