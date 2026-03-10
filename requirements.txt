@@ -5,3 +5,4 @@ feedparser
 numpy
 plotly
 pandas_market_calendars
+scipy
