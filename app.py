@@ -55,7 +55,13 @@ else:
     st.sidebar.info("Stocks only have Monthly expiries.")
     freq = "Monthly"
 
+if 'analyze_triggered' not in st.session_state:
+    st.session_state.analyze_triggered = False
+
 if st.sidebar.button("Analyze"):
+    st.session_state.analyze_triggered = True
+
+if st.session_state.analyze_triggered:
     with st.spinner(f"Fetching data and calculating cycles for {selected_name}..."):
         # 1. Fetch Data
         main_start_dt = datetime.combine(start_date_val, datetime.min.time())
@@ -130,9 +136,9 @@ if st.sidebar.button("Analyze"):
             
             st.write(f"**Active Cycle Expiry:** {expiry_date_val} | **Live Price (YY):** {live_price:.2f} | **Cycle Open (XX):** {cycle_start_open:.2f}")
             if not np.isnan(live_sigma):
-                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\sigma$):** {live_sigma*100:.2f}%")
+                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\\sigma$):** {live_sigma*100:.2f}%")
             else:
-                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\sigma$):** N/A")
+                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\\sigma$):** N/A")
             
             if days_left > 0 and not np.isnan(live_sigma):
                 expected_move = live_price * live_sigma * math.sqrt(days_left / 252)
@@ -326,74 +332,87 @@ if st.sidebar.button("Analyze"):
             target_conf = st.selectbox("Target Confidence Level", confidence_levels, index=2) # Default 90%
             
         if not active_cycles.empty and days_left > 0 and not np.isnan(live_sigma):
-            # 1. Provide Rounding Helper based on current asset
-            def get_rounded_strike(price, ticker):
-                nifty_fin_family = ['^NSEI', 'NIFTY_FIN_SERVICE.NS'] # NIFTY 50, FINNIFTY
-                bank_mid_family = ['^NSEBANK', 'BSE-SENSEX.BO', 'NIFTY_MID_SELECT.NS'] # BANKNIFTY, SENSEX, MIDCPNIFTY
+            try:
+                # 1. Provide Rounding Helper based on current asset
+                def get_rounded_strike(price, ticker):
+                    nifty_fin_family = ['^NSEI', '^CNXFIN'] # NIFTY 50, FINNIFTY
+                    bank_mid_family = ['^NSEBANK', '^BSESN', '^MIDCPNIFTY'] # BANKNIFTY, SENSEX, MIDCPNIFTY
+                    
+                    if ticker in nifty_fin_family:
+                        return round(price / 50) * 50
+                    elif ticker in bank_mid_family:
+                        return round(price / 100) * 100
+                    else: # Stocks logic
+                        if price < 100: return round(price)
+                        elif price < 250: return map_to_nearest(price, 2.5)
+                        elif price < 500: return map_to_nearest(price, 5)
+                        elif price < 1000: return map_to_nearest(price, 10)
+                        elif price < 2500: return map_to_nearest(price, 20)
+                        else: return map_to_nearest(price, 50)
+                        
+                def map_to_nearest(val, step):
+                    return round(val / step) * step
+    
+                # 2. Extract Cone Bands for chosen confidence
+                # Rebuilding z_scores mapping just in case it is out of scope.
+                local_z_scores = {
+                    "50%": 0.674,
+                    "70%": 1.036,
+                    "80%": 1.282,
+                    "90%": 1.645,
+                    "95%": 1.960,
+                    "99%": 2.576
+                }
                 
-                if ticker in nifty_fin_family:
-                    return round(price / 50) * 50
-                elif ticker in bank_mid_family:
-                    return round(price / 100) * 100
-                else: # Stocks logic
-                    if price < 100: return round(price)
-                    elif price < 250: return map_to_nearest(price, 2.5)
-                    elif price < 500: return map_to_nearest(price, 5)
-                    elif price < 1000: return map_to_nearest(price, 10)
-                    elif price < 2500: return map_to_nearest(price, 20)
-                    else: return map_to_nearest(price, 50)
-                    
-            def map_to_nearest(val, step):
-                return round(val / step) * step
-
-            # 2. Extract Cone Bands for chosen confidence
-            selected_z = z_scores[target_conf]
-            upper_band = live_price + (expected_move * selected_z)
-            lower_band = live_price - (expected_move * selected_z)
-            
-            # 3. Intersection Rule with S/R Clusters (2% proximity trigger)
-            calc_short_call = upper_band
-            calc_short_put = lower_band
-            
-            # Find nearest resistance above upper_band
-            valid_res = [c['price'] for c in resistance_clusters if c['price'] >= upper_band]
-            if valid_res:
-                nearest_res = min(valid_res)
-                if nearest_res <= upper_band * 1.02: # Within 2% trigger
-                    calc_short_call = nearest_res
-                    
-            # Find nearest support below lower_band
-            valid_sup = [c['price'] for c in support_clusters if c['price'] <= lower_band]
-            if valid_sup:
-                nearest_sup = max(valid_sup)
-                if nearest_sup >= lower_band * 0.98: # Within 2% trigger
-                    calc_short_put = nearest_sup
-                    
-            # 4. Heat Filter (Long Wings)
-            conf_val = float(target_conf.strip('%'))
-            pct_upside_heat = np.percentile(enriched_cycles['Max +ve Delta (%)'].dropna(), conf_val)
-            pct_downside_heat = np.percentile(enriched_cycles['Max -ve Delta (%)'].dropna().abs(), conf_val)
-            
-            calc_long_call = calc_short_call * (1 + (pct_upside_heat / 100))
-            calc_long_put = calc_short_put * (1 - (pct_downside_heat / 100))
-            
-            # 5. Snap to valid Exchange Strikes
-            final_short_call = get_rounded_strike(calc_short_call, selected_ticker)
-            final_short_put = get_rounded_strike(calc_short_put, selected_ticker)
-            final_long_call = get_rounded_strike(calc_long_call, selected_ticker)
-            final_long_put = get_rounded_strike(calc_long_put, selected_ticker)
-            
-            col_ss, col_ic = st.columns(2)
-            
-            with col_ss:
-                st.markdown(f"### 📉 Short Strangle (`{target_conf}` Confidence)")
-                st.info(f"**Short Call:** {final_short_call:,.0f} CE\n\n**Short Put:** {final_short_put:,.0f} PE")
+                selected_z = local_z_scores[target_conf]
+                upper_band = live_price + (expected_move * selected_z)
+                lower_band = live_price - (expected_move * selected_z)
                 
-            with col_ic:
-                st.markdown(f"### 🦅 Iron Condor (`{target_conf}` Confidence)")
-                st.success(f"**Long Call Wing:** {final_long_call:,.0f} CE\n\n**Short Call:** {final_short_call:,.0f} CE\n\n**Short Put:** {final_short_put:,.0f} PE\n\n**Long Put Wing:** {final_long_put:,.0f} PE")
-            
-            st.caption("*Short strikes are placed outside both the selected statistical probability cone and the nearest structural S/R zones. Long protective wings are placed outside the corresponding percentile of historical intra-cycle drawdowns.*")
+                # 3. Intersection Rule with S/R Clusters (2% proximity trigger)
+                calc_short_call = upper_band
+                calc_short_put = lower_band
+                
+                # Find nearest resistance above upper_band
+                valid_res = [c['price'] for c in resistance_clusters if c['price'] >= upper_band]
+                if valid_res:
+                    nearest_res = min(valid_res)
+                    if nearest_res <= upper_band * 1.02: # Within 2% trigger
+                        calc_short_call = nearest_res
+                        
+                # Find nearest support below lower_band
+                valid_sup = [c['price'] for c in support_clusters if c['price'] <= lower_band]
+                if valid_sup:
+                    nearest_sup = max(valid_sup)
+                    if nearest_sup >= lower_band * 0.98: # Within 2% trigger
+                        calc_short_put = nearest_sup
+                        
+                # 4. Heat Filter (Long Wings)
+                conf_val = float(target_conf.strip('%'))
+                pct_upside_heat = np.percentile(enriched_cycles['Max +ve Delta (%)'].dropna(), conf_val)
+                pct_downside_heat = np.percentile(enriched_cycles['Max -ve Delta (%)'].dropna().abs(), conf_val)
+                
+                calc_long_call = calc_short_call * (1 + (pct_upside_heat / 100))
+                calc_long_put = calc_short_put * (1 - (pct_downside_heat / 100))
+                
+                # 5. Snap to valid Exchange Strikes
+                final_short_call = get_rounded_strike(calc_short_call, selected_ticker)
+                final_short_put = get_rounded_strike(calc_short_put, selected_ticker)
+                final_long_call = get_rounded_strike(calc_long_call, selected_ticker)
+                final_long_put = get_rounded_strike(calc_long_put, selected_ticker)
+                
+                col_ss, col_ic = st.columns(2)
+                
+                with col_ss:
+                    st.markdown(f"### 📉 Short Strangle (`{target_conf}` Confidence)")
+                    st.info(f"**Short Call:** {final_short_call:,.0f} CE\n\n**Short Put:** {final_short_put:,.0f} PE")
+                    
+                with col_ic:
+                    st.markdown(f"### 🦅 Iron Condor (`{target_conf}` Confidence)")
+                    st.success(f"**Long Call Wing:** {final_long_call:,.0f} CE\n\n**Short Call:** {final_short_call:,.0f} CE\n\n**Short Put:** {final_short_put:,.0f} PE\n\n**Long Put Wing:** {final_long_put:,.0f} PE")
+                
+                st.caption("*Short strikes are placed outside both the selected statistical probability cone and the nearest structural S/R zones. Long protective wings are placed outside the corresponding percentile of historical intra-cycle drawdowns.*")
+            except Exception as e:
+                st.error(f"Error calculating trade setup: {e}")
 
         else:
             st.info("Algorithmic Trade Setup requires an active expiry cycle with computable live volatility bounds.")
