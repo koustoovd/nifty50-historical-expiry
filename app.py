@@ -133,15 +133,16 @@ if st.session_state.analyze_triggered:
             # Calculate trading days left using valid trading calendar
             valid_days = get_valid_trading_days(today_date.strftime('%Y-%m-%d'), expiry_date_val.strftime('%Y-%m-%d'))
             days_left = max(0, len(valid_days) - 1)
+            effective_days = max(1, days_left) # Used for mathematical calculations
             
             st.write(f"**Active Cycle Expiry:** {expiry_date_val} | **Live Price (YY):** {live_price:.2f} | **Cycle Open (XX):** {cycle_start_open:.2f}")
             if not np.isnan(live_sigma):
-                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\\sigma$):** {live_sigma*100:.2f}%")
+                st.write(f"**Trading Days Left (ZZ):** {days_left} (Effective Volatility Days: {effective_days}) | **Annualized Volatility ($\sigma$):** {live_sigma*100:.2f}%")
             else:
-                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\\sigma$):** N/A")
+                st.write(f"**Trading Days Left (ZZ):** {days_left} | **Annualized Volatility ($\sigma$):** N/A")
             
-            if days_left > 0 and not np.isnan(live_sigma):
-                expected_move = live_price * live_sigma * math.sqrt(days_left / 252)
+            if not np.isnan(live_sigma):
+                expected_move = live_price * live_sigma * math.sqrt(effective_days / 252)
                 z_scores = {
                     "50%": 0.674,
                     "70%": 1.036,
@@ -162,7 +163,7 @@ if st.session_state.analyze_triggered:
                 bands_df = pd.DataFrame(bands_data).round(2)
                 st.table(bands_df.set_index("Confidence Level").T)
             else:
-                st.info("Expiry is today or volatility data is missing. Cone calculation not applicable.")
+                st.info("Volatility data is missing. Cone calculation not applicable.")
         else:
             st.info("No active cycle currently found overlapping today's date.")
             
@@ -331,7 +332,7 @@ if st.session_state.analyze_triggered:
         with col_ts_conf:
             target_conf = st.selectbox("Target Confidence Level", confidence_levels, index=2) # Default 90%
             
-        if not active_cycles.empty and days_left > 0 and not np.isnan(live_sigma):
+        if not active_cycles.empty and not np.isnan(live_sigma):
             try:
                 # 1. Provide Rounding Helper based on current asset
                 def get_rounded_strike(price, ticker):
