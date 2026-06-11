@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import scipy.signal as signal
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 import math
 import concurrent.futures
 
@@ -203,12 +202,16 @@ if st.session_state.analyze_triggered:
         st.markdown("---")
         st.subheader("🧱 Support & Resistance Analysis")
         
-        # 1. Mathematical S/R Identification
+        # 1. Multi-Source S/R Identification
         sr_ticker_data = full_ticker_data[(full_ticker_data.index >= sr_start_dt) & (full_ticker_data.index <= sr_end_dt)].copy()
+        sr_vix_data = full_vix_data[(full_vix_data.index >= sr_start_dt) & (full_vix_data.index <= sr_end_dt)].copy()
         
         if not sr_ticker_data.empty:
-            # Compute S/R levels via trade_logic module
-            top_supports, top_resistances, support_clusters, resistance_clusters = compute_sr_levels(sr_ticker_data)
+            # Compute S/R levels via trade_logic module (8 sources)
+            top_supports, top_resistances, support_clusters, resistance_clusters, ema_lines_sr, unfilled_gaps = compute_sr_levels(
+                sr_ticker_data, vix_data=sr_vix_data, full_data_for_ema=full_ticker_data,
+                enriched_cycles=enriched_cycles, ticker=selected_ticker,
+            )
             current_price = sr_ticker_data['Close'].iloc[-1]
             
             # Helper function to map dates to expiry cycles
@@ -233,17 +236,31 @@ if st.session_state.analyze_triggered:
             col_sr_text, col_sr_chart = st.columns([1, 2])
             
             with col_sr_text:
-                st.markdown("#### Nearest Resistances")
+                st.markdown("#### Strongest Nearby Resistances")
                 for i, r in enumerate(top_resistances):
                     cycle_mapping_str = get_expiry_mapping_string(r['dates'])
-                    st.write(f"**Resistance {i+1} at {r['price']:.2f}**: The asset failed to break this 1% zone {r['touches']} times in the selected timeframe {cycle_mapping_str}.")
+                    src_str = ", ".join(r['sources'])
+                    st.write(
+                        f"**R{i+1} at {r['price']:.2f}** (Strength: {r['strength']:.1f}) — "
+                        f"{r['touches']} touches via _{src_str}_, "
+                        f"avg VIX: {r['avg_vix_at_touch']:.1f}, "
+                        f"last: {pd.Timestamp(r['last_touch_date']).date()} "
+                        f"{cycle_mapping_str}"
+                    )
                 if not top_resistances:
                     st.write("No resistances found above current price.")
                     
-                st.markdown("#### Nearest Supports")
+                st.markdown("#### Strongest Nearby Supports")
                 for i, s in enumerate(top_supports):
                     cycle_mapping_str = get_expiry_mapping_string(s['dates'])
-                    st.write(f"**Support {i+1} at {s['price']:.2f}**: The asset defended this 1% zone {s['touches']} times in the selected timeframe {cycle_mapping_str}.")
+                    src_str = ", ".join(s['sources'])
+                    st.write(
+                        f"**S{i+1} at {s['price']:.2f}** (Strength: {s['strength']:.1f}) — "
+                        f"{s['touches']} touches via _{src_str}_, "
+                        f"avg VIX: {s['avg_vix_at_touch']:.1f}, "
+                        f"last: {pd.Timestamp(s['last_touch_date']).date()} "
+                        f"{cycle_mapping_str}"
+                    )
                 if not top_supports:
                     st.write("No supports found below current price.")
                     
@@ -254,23 +271,66 @@ if st.session_state.analyze_triggered:
                     high=sr_ticker_data['High'],
                     low=sr_ticker_data['Low'],
                     close=sr_ticker_data['Close'],
-                    name="Candlesticks"
+                    name="Price"
                 )])
-                
+
+                # EMA + Bollinger Band overlay lines
+                ema_colors = {
+                    'EMA_50':    '#00d4ff',
+                    'EMA_100':   '#ff9800',
+                    'EMA_200':   '#e040fb',
+                    'BB_upper':  'rgba(255,255,100,0.7)',
+                    'BB_mid':    'rgba(255,255,100,0.35)',
+                    'BB_lower':  'rgba(255,255,100,0.7)',
+                }
+                for ema_name, ema_series in ema_lines_sr.items():
+                    is_bb = ema_name.startswith('BB_')
+                    fig_candlestick.add_trace(go.Scatter(
+                        x=ema_series.index, y=ema_series.values,
+                        mode='lines', name=ema_name,
+                        line=dict(
+                            color=ema_colors.get(ema_name, 'white'),
+                            width=1.0 if is_bb else 1.5,
+                            dash='dot' if is_bb else 'solid',
+                        ),
+                    ))
+
+                # Unfilled gap zones (semi-transparent rectangles)
+                for gap in unfilled_gaps:
+                    gap_color = 'rgba(255, 235, 59, 0.08)' if gap['direction'] == 'gap_up' else 'rgba(255, 87, 34, 0.08)'
+                    fig_candlestick.add_shape(
+                        type='rect',
+                        x0=gap['date'], x1=sr_ticker_data.index[-1],
+                        y0=gap['bottom'], y1=gap['top'],
+                        fillcolor=gap_color, line=dict(width=0), layer='below',
+                    )
+
+                # S/R horizontal lines with source labels
                 for s in top_supports:
-                    fig_candlestick.add_hline(y=s['price'], line_dash="dash", line_color="green", annotation_text=f"Support ({s['touches']} touches)", annotation_position="bottom right")
-                    
+                    src_label = "/".join(s['sources'])
+                    fig_candlestick.add_hline(
+                        y=s['price'], line_dash="dash", line_color="green",
+                        annotation_text=f"S {s['price']:.0f} [{s['touches']}t, {src_label}]",
+                        annotation_position="bottom right",
+                    )
+
                 for r in top_resistances:
-                    fig_candlestick.add_hline(y=r['price'], line_dash="dash", line_color="red", annotation_text=f"Resistance ({r['touches']} touches)", annotation_position="top right")
-                
+                    src_label = "/".join(r['sources'])
+                    fig_candlestick.add_hline(
+                        y=r['price'], line_dash="dash", line_color="red",
+                        annotation_text=f"R {r['price']:.0f} [{r['touches']}t, {src_label}]",
+                        annotation_position="top right",
+                    )
+
                 fig_candlestick.update_layout(
-                    title=f"{selected_name} Daily Chart with S/R Levels (S/R Range)",
+                    title=f"{selected_name} — S/R Analysis with EMAs & Gap Zones",
                     xaxis_title="Date",
                     yaxis_title="Price",
                     xaxis_rangeslider_visible=False,
-                    margin=dict(l=0, r=0, t=40, b=0)
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
-                
+
                 st.plotly_chart(fig_candlestick, use_container_width=True)
         else:
             st.warning("Not enough data points within the chosen S/R Date Range to calculate Supports and Resistances.")
@@ -343,7 +403,66 @@ if st.session_state.analyze_triggered:
                 "Max -ve Delta (%)": st.column_config.NumberColumn(format="%.2f%%"),
             }
         )
-        
+
+        # --- Expiry Delta Chart ---
+        st.markdown("#### 📈 Expiry Cycle Delta Chart")
+        st.caption("Cycle Return % vs Max Uptick % vs Max Drawdown % across all expiry cycles (chronological order).")
+
+        chart_df = enriched_cycles.copy()
+        chart_df = chart_df.sort_values(by='Expiry Date', ascending=True)
+        chart_df['Expiry Label'] = chart_df['Expiry Date'].dt.strftime('%d-%b-%y')
+
+        fig_deltas = go.Figure()
+
+        fig_deltas.add_trace(go.Scatter(
+            x=chart_df['Expiry Label'],
+            y=chart_df['Cycle Return (%)'],
+            mode='lines+markers',
+            name='Cycle Return (%)',
+            line=dict(color='royalblue', width=2),
+            marker=dict(size=4),
+        ))
+
+        if 'Max +ve Delta (%)' in chart_df.columns:
+            fig_deltas.add_trace(go.Scatter(
+                x=chart_df['Expiry Label'],
+                y=chart_df['Max +ve Delta (%)'],
+                mode='lines+markers',
+                name='Max Uptick (%)',
+                line=dict(color='limegreen', width=2, dash='dot'),
+                marker=dict(size=4),
+            ))
+
+        if 'Max -ve Delta (%)' in chart_df.columns:
+            fig_deltas.add_trace(go.Scatter(
+                x=chart_df['Expiry Label'],
+                y=chart_df['Max -ve Delta (%)'],
+                mode='lines+markers',
+                name='Max Drawdown (%)',
+                line=dict(color='tomato', width=2, dash='dot'),
+                marker=dict(size=4),
+            ))
+
+        fig_deltas.add_hline(y=0, line_color='white', line_width=1, opacity=0.3)
+
+        fig_deltas.update_layout(
+            template='plotly_dark',
+            title=f"{selected_name} — Expiry Week Deltas ({freq})",
+            xaxis_title="Expiry Week",
+            yaxis_title="Percentage (%)",
+            xaxis=dict(
+                tickangle=-45,
+                tickmode='auto',
+                nticks=20,
+            ),
+            yaxis=dict(ticksuffix="%"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=0, r=0, t=60, b=60),
+            height=420,
+        )
+
+        st.plotly_chart(fig_deltas, use_container_width=True)
+
         # Layout: Row 3 - Extreme Move News Fetcher
         st.markdown("---")
         st.subheader("📰 Extreme Move Analysis (>90th & <10th Percentile)")
