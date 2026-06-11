@@ -5,7 +5,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import math
-import concurrent.futures
 
 # Import custom modules
 from data_collection import get_nifty50_tickers, get_indices_tickers, fetch_historical_data, fetch_india_vix
@@ -73,12 +72,10 @@ if st.session_state.analyze_triggered:
         fetch_start_dt = min(main_start_dt, sr_start_dt)
         fetch_end_dt = max(main_end_dt, sr_end_dt)
         
-        # Fetch ticker and VIX data in parallel to reduce total wall-clock time
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_ticker = executor.submit(load_data, selected_ticker, False, fetch_start_dt, fetch_end_dt)
-            future_vix    = executor.submit(load_data, '^INDIAVIX', True, fetch_start_dt, fetch_end_dt)
-            full_ticker_data = future_ticker.result()
-            full_vix_data    = future_vix.result()
+        # Fetch sequentially — yfinance shares a global session and is not safe
+        # to call concurrently for different tickers (data can cross-contaminate)
+        full_ticker_data = load_data(selected_ticker, False, fetch_start_dt, fetch_end_dt)
+        full_vix_data    = load_data('^INDIAVIX',    True,  fetch_start_dt, fetch_end_dt)
         
         # Slice for main expiry
         ticker_data = full_ticker_data[(full_ticker_data.index >= main_start_dt) & (full_ticker_data.index <= main_end_dt)].copy()

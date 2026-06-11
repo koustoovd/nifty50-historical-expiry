@@ -534,10 +534,17 @@ def _detect_monthly_pivots(sr_ticker_data):
     if len(sr_ticker_data) < 20:
         return []
 
-    monthly = (sr_ticker_data
-               .resample('ME')
-               .agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
-               .dropna())
+    # 'ME' (month-end) was introduced in pandas 2.2; older pandas uses 'M'
+    try:
+        monthly = (sr_ticker_data
+                   .resample('ME')
+                   .agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
+                   .dropna())
+    except ValueError:
+        monthly = (sr_ticker_data
+                   .resample('M')
+                   .agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
+                   .dropna())
 
     if len(monthly) < 2:
         return []
