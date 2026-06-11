@@ -39,11 +39,15 @@ def fetch_historical_data(ticker, start_date=None, end_date=None, years=None):
         # Buffer before start_date to allow rolling stats calculation
         start_date = start_date - timedelta(days=30)
     
-    data = yf.download(ticker, start=start_date, end=end_date)
+    data = yf.download(ticker, start=start_date, end=end_date, progress=False)
     # yf.download sometimes returns MultiIndex columns if a single ticker is passed as list or depending on version.
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.droplevel(1)
-        
+
+    # Robustness: forward-fill any missing trading day values (yfinance gaps for Indian tickers),
+    # then drop any remaining leading NaNs that cannot be filled.
+    data = data.ffill().dropna()
+
     return data
 
 def fetch_india_vix(start_date=None, end_date=None, years=None):

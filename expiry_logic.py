@@ -171,9 +171,9 @@ def extract_expiry_cycles(df, identifier_type, identifier, freq="Weekly"):
             
             # 3. Calculate Intra-cycle Max/Min Delta
             highest_high = cycle_data['High'].max()
-            highest_high_date = cycle_data['High'].idxmax().date()
+            highest_high_date = pd.Timestamp(cycle_data['High'].idxmax()).date()
             lowest_low = cycle_data['Low'].min()
-            lowest_low_date = cycle_data['Low'].idxmin().date()
+            lowest_low_date = pd.Timestamp(cycle_data['Low'].idxmin()).date()
             
             max_pos_delta = ((highest_high - start_open) / start_open) * 100
             max_neg_delta = ((lowest_low - start_open) / start_open) * 100

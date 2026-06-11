@@ -6,12 +6,14 @@ import plotly.graph_objects as go
 import scipy.signal as signal
 from datetime import datetime, date, timedelta
 import math
+import concurrent.futures
 
 # Import custom modules
 from data_collection import get_nifty50_tickers, get_indices_tickers, fetch_historical_data, fetch_india_vix
 from expiry_logic import extract_expiry_cycles, get_valid_trading_days
 from metrics import enrich_cycles_with_metrics
 from news_fetcher import fetch_extreme_move_news
+from trade_logic import compute_sr_levels, compute_trade_setup
 
 st.set_page_config(page_title="Historical Expiry Dashboard", layout="wide", page_icon="📈")
 
@@ -72,8 +74,12 @@ if st.session_state.analyze_triggered:
         fetch_start_dt = min(main_start_dt, sr_start_dt)
         fetch_end_dt = max(main_end_dt, sr_end_dt)
         
-        full_ticker_data = load_data(selected_ticker, start_date=fetch_start_dt, end_date=fetch_end_dt)
-        full_vix_data = load_data('^INDIAVIX', is_vix=True, start_date=fetch_start_dt, end_date=fetch_end_dt)
+        # Fetch ticker and VIX data in parallel to reduce total wall-clock time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_ticker = executor.submit(load_data, selected_ticker, False, fetch_start_dt, fetch_end_dt)
+            future_vix    = executor.submit(load_data, '^INDIAVIX', True, fetch_start_dt, fetch_end_dt)
+            full_ticker_data = future_ticker.result()
+            full_vix_data    = future_vix.result()
         
         # Slice for main expiry
         ticker_data = full_ticker_data[(full_ticker_data.index >= main_start_dt) & (full_ticker_data.index <= main_end_dt)].copy()
@@ -201,59 +207,9 @@ if st.session_state.analyze_triggered:
         sr_ticker_data = full_ticker_data[(full_ticker_data.index >= sr_start_dt) & (full_ticker_data.index <= sr_end_dt)].copy()
         
         if not sr_ticker_data.empty:
-            close_prices = sr_ticker_data['Close'].values
-            dates_index = sr_ticker_data.index
-            order = 5 # 5 days on either side
-            
-            # Find local minima (support candidates) and maxima (resistance candidates)
-            local_min_idx = signal.argrelextrema(close_prices, np.less, order=order)[0]
-            local_max_idx = signal.argrelextrema(close_prices, np.greater, order=order)[0]
-            
-            # Track dates along with prices
-            swing_lows = [(close_prices[i], dates_index[i]) for i in local_min_idx]
-            swing_highs = [(close_prices[i], dates_index[i]) for i in local_max_idx]
-            
-            # 2. Price Clustering & Touch Counting
-            def cluster_levels(levels_with_dates, tolerance_pct=0.01):
-                if len(levels_with_dates) == 0:
-                    return []
-                # Sort by price
-                levels_sorted = sorted(levels_with_dates, key=lambda x: x[0])
-                clusters = []
-                current_cluster_prices = [levels_sorted[0][0]]
-                current_cluster_dates = [levels_sorted[0][1]]
-                
-                for i in range(1, len(levels_sorted)):
-                    if levels_sorted[i][0] <= current_cluster_prices[0] * (1 + tolerance_pct):
-                        current_cluster_prices.append(levels_sorted[i][0])
-                        current_cluster_dates.append(levels_sorted[i][1])
-                    else:
-                        clusters.append({
-                            'price': np.mean(current_cluster_prices),
-                            'touches': len(current_cluster_prices),
-                            'dates': current_cluster_dates
-                        })
-                        current_cluster_prices = [levels_sorted[i][0]]
-                        current_cluster_dates = [levels_sorted[i][1]]
-                
-                clusters.append({
-                    'price': np.mean(current_cluster_prices),
-                    'touches': len(current_cluster_prices),
-                    'dates': current_cluster_dates
-                })
-                return clusters
-    
-            support_clusters = cluster_levels(swing_lows, 0.01)
-            resistance_clusters = cluster_levels(swing_highs, 0.01)
-            
-            # 3. Proximity Filtering
+            # Compute S/R levels via trade_logic module
+            top_supports, top_resistances, support_clusters, resistance_clusters = compute_sr_levels(sr_ticker_data)
             current_price = sr_ticker_data['Close'].iloc[-1]
-            
-            resistances = [c for c in resistance_clusters if c['price'] > current_price]
-            supports = [c for c in support_clusters if c['price'] < current_price]
-            
-            top_resistances = sorted(resistances, key=lambda x: x['price'] - current_price)[:3]
-            top_supports = sorted(supports, key=lambda x: current_price - x['price'])[:3]
             
             # Helper function to map dates to expiry cycles
             def get_expiry_mapping_string(touch_dates):
@@ -334,72 +290,12 @@ if st.session_state.analyze_triggered:
             
         if not active_cycles.empty and not np.isnan(live_sigma):
             try:
-                # 1. Provide Rounding Helper based on current asset
-                def get_rounded_strike(price, ticker):
-                    nifty_fin_family = ['^NSEI', '^CNXFIN'] # NIFTY 50, FINNIFTY
-                    bank_mid_family = ['^NSEBANK', '^BSESN', '^MIDCPNIFTY'] # BANKNIFTY, SENSEX, MIDCPNIFTY
-                    
-                    if ticker in nifty_fin_family:
-                        return round(price / 50) * 50
-                    elif ticker in bank_mid_family:
-                        return round(price / 100) * 100
-                    else: # Stocks logic
-                        if price < 100: return round(price)
-                        elif price < 250: return map_to_nearest(price, 2.5)
-                        elif price < 500: return map_to_nearest(price, 5)
-                        elif price < 1000: return map_to_nearest(price, 10)
-                        elif price < 2500: return map_to_nearest(price, 20)
-                        else: return map_to_nearest(price, 50)
-                        
-                def map_to_nearest(val, step):
-                    return round(val / step) * step
-    
-                # 2. Extract Cone Bands for chosen confidence
-                # Rebuilding z_scores mapping just in case it is out of scope.
-                local_z_scores = {
-                    "50%": 0.674,
-                    "70%": 1.036,
-                    "80%": 1.282,
-                    "90%": 1.645,
-                    "95%": 1.960,
-                    "99%": 2.576
-                }
-                
-                selected_z = local_z_scores[target_conf]
-                upper_band = live_price + (expected_move * selected_z)
-                lower_band = live_price - (expected_move * selected_z)
-                
-                # 3. Intersection Rule with S/R Clusters (2% proximity trigger)
-                calc_short_call = upper_band
-                calc_short_put = lower_band
-                
-                # Find nearest resistance above upper_band
-                valid_res = [c['price'] for c in resistance_clusters if c['price'] >= upper_band]
-                if valid_res:
-                    nearest_res = min(valid_res)
-                    if nearest_res <= upper_band * 1.02: # Within 2% trigger
-                        calc_short_call = nearest_res
-                        
-                # Find nearest support below lower_band
-                valid_sup = [c['price'] for c in support_clusters if c['price'] <= lower_band]
-                if valid_sup:
-                    nearest_sup = max(valid_sup)
-                    if nearest_sup >= lower_band * 0.98: # Within 2% trigger
-                        calc_short_put = nearest_sup
-                        
-                # 4. Heat Filter (Long Wings)
-                conf_val = float(target_conf.strip('%'))
-                pct_upside_heat = np.percentile(enriched_cycles['Max +ve Delta (%)'].dropna(), conf_val)
-                pct_downside_heat = np.percentile(enriched_cycles['Max -ve Delta (%)'].dropna().abs(), conf_val)
-                
-                calc_long_call = calc_short_call * (1 + (pct_upside_heat / 100))
-                calc_long_put = calc_short_put * (1 - (pct_downside_heat / 100))
-                
-                # 5. Snap to valid Exchange Strikes
-                final_short_call = get_rounded_strike(calc_short_call, selected_ticker)
-                final_short_put = get_rounded_strike(calc_short_put, selected_ticker)
-                final_long_call = get_rounded_strike(calc_long_call, selected_ticker)
-                final_long_put = get_rounded_strike(calc_long_put, selected_ticker)
+                # Compute trade strikes via trade_logic module
+                final_short_call, final_short_put, final_long_call, final_long_put = compute_trade_setup(
+                    live_price, expected_move, enriched_cycles,
+                    target_conf, selected_ticker,
+                    resistance_clusters, support_clusters
+                )
                 
                 col_ss, col_ic = st.columns(2)
                 
