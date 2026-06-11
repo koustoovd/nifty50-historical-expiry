@@ -935,3 +935,199 @@ def compute_trade_setup(live_price, expected_move, enriched_cycles, target_conf,
         get_rounded_strike(calc_long_call,  selected_ticker),
         get_rounded_strike(calc_long_put,   selected_ticker),
     )
+
+
+# ===========================================================================
+# Ranked multi-strategy recommendations
+# ===========================================================================
+
+def generate_strategy_recommendations(
+    live_price, expected_move, enriched_cycles,
+    selected_ticker, support_clusters, resistance_clusters,
+    current_vix=None,
+):
+    """
+    Generate and rank 5 options strategy recommendations combining:
+      - Probability cone (Z-score bands from expected_move)
+      - S/R level snapping (strongest cluster within 5% of cone edge)
+      - Historical win rate (% of past cycles contained within ±strike% of current price)
+      - VIX regime appropriateness
+
+    Strategies (before ranking):
+      1. Short Straddle          — both legs at ATM; WR computed over ±EM breakeven zone
+      2. Strangle — Tight        — 70% cone, raw cone edges (no S/R snap)
+      3. Strangle — S/R Aligned  — 90% cone snapped to nearest structural S/R within 5%
+      4. Iron Condor — Standard  — Strategy 3 shorts + 90th-pctile historical drawdown wings
+      5. Iron Condor — Conservative — 95% cone snapped + 95th-pctile wings
+
+    Composite confidence score (0–100):
+      50% × historical_win_rate + 30% × sr_score + 20% × vix_fit
+
+    Historical win rate is return-percentage based — price-level-independent so it remains
+    valid across history even when absolute NIFTY levels have changed significantly.
+    """
+    _NIFTY = ['^NSEI', '^CNXFIN']
+    _BANK  = ['^NSEBANK', '^BSESN', '^MIDCPNIFTY']
+    _Z     = {'70%': 1.036, '90%': 1.645, '95%': 1.960}
+
+    def _round(price):
+        if selected_ticker in _NIFTY: return int(round(price / 50)  * 50)
+        if selected_ticker in _BANK:  return int(round(price / 100) * 100)
+        if price < 100:   return int(round(price))
+        if price < 250:   return float(round(price / 2.5) * 2.5)
+        if price < 500:   return float(round(price / 5)   * 5)
+        if price < 1000:  return float(round(price / 10)  * 10)
+        if price < 2500:  return float(round(price / 20)  * 20)
+        return float(round(price / 50) * 50)
+
+    def _snap(raw, clusters, side, window=0.05):
+        """Return (snapped_price, cluster_dict | None) — picks strongest cluster within window."""
+        if side == 'above':
+            cands = [c for c in clusters if raw <= c['price'] <= raw * (1 + window)]
+        else:
+            cands = [c for c in clusters if raw * (1 - window) <= c['price'] <= raw]
+        if not cands:
+            return raw, None
+        best = max(cands, key=lambda c: c['strength'])
+        return best['price'], best
+
+    def _win_rate(sc_p, sp_p):
+        """% of historical cycles where Cycle Return (%) ∈ [−put_pct%, +call_pct%].
+        Uses relative offsets from live_price so it works across different price regimes."""
+        if enriched_cycles.empty or 'Cycle Return (%)' not in enriched_cycles.columns:
+            return 50.0
+        rets = enriched_cycles['Cycle Return (%)'].dropna()
+        if len(rets) < 5:
+            return 50.0
+        call_pct = (sc_p - live_price) / live_price * 100
+        put_pct  = (live_price - sp_p) / live_price * 100
+        return float(((rets <= call_pct) & (rets >= -put_pct)).sum() / len(rets) * 100)
+
+    def _sr_score(sc, sp, window=0.015):
+        """S/R confirmation 0–100: strength of nearest S/R level at each strike,
+        normalized by the max cluster strength across all detected levels."""
+        c_near = [c for c in resistance_clusters if abs(c['price'] - sc) / sc <= window]
+        p_near = [c for c in support_clusters    if abs(c['price'] - sp) / sp <= window]
+        c_str  = max((c['strength'] for c in c_near), default=0.0)
+        p_str  = max((c['strength'] for c in p_near), default=0.0)
+        all_s  = [c['strength'] for c in resistance_clusters + support_clusters]
+        max_s  = max(all_s) if all_s else 1.0
+        return (c_str + p_str) / (2 * max_s) * 100
+
+    def _vix_fit(strat_type):
+        """VIX-regime appropriateness 0–100.
+        Straddle: quiet (VIX < 14). Tight strangle: moderate VIX 14–20.
+        S/R strangle + IC standard: 15–22. Conservative IC: elevated > 18."""
+        try:
+            vix = float(current_vix) if current_vix is not None else 15.0
+            if np.isnan(vix):
+                vix = 15.0
+        except (TypeError, ValueError):
+            vix = 15.0
+        if strat_type == 'straddle':
+            return 100 if vix < 14 else (70 if vix < 18 else 40)
+        if strat_type == 'strangle_tight':
+            return 100 if 14 <= vix <= 20 else (70 if vix < 25 else 45)
+        if strat_type in ('strangle_sr', 'ic_standard'):
+            return 100 if 15 <= vix <= 22 else 75
+        if strat_type == 'ic_conservative':
+            return 100 if vix > 18 else (80 if vix > 14 else 60)
+        return 70
+
+    def _build(name, strat_type, sc_raw, sp_raw, lc_raw=None, lp_raw=None,
+               sc_clus=None, sp_clus=None, wr_sc=None, wr_sp=None):
+        sc = _round(sc_raw);  sp = _round(sp_raw)
+        lc = _round(lc_raw) if lc_raw is not None else None
+        lp = _round(lp_raw) if lp_raw is not None else None
+        wr = _win_rate(wr_sc if wr_sc is not None else sc_raw,
+                       wr_sp if wr_sp is not None else sp_raw)
+        sr = _sr_score(sc, sp)
+        vf = _vix_fit(strat_type)
+        bw_hi = wr_sc if wr_sc is not None else sc_raw
+        bw_lo = wr_sp if wr_sp is not None else sp_raw
+        return {
+            'name':                name,
+            'type':                strat_type,
+            'short_call':          sc,
+            'short_put':           sp,
+            'long_call':           lc,
+            'long_put':            lp,
+            'historical_win_rate': round(wr, 1),
+            'sr_score':            round(sr, 1),
+            'sr_call_confirmed':   sc_clus is not None,
+            'sr_put_confirmed':    sp_clus is not None,
+            'sr_call_strength':    round(sc_clus['strength'], 1) if sc_clus else 0.0,
+            'sr_put_strength':     round(sp_clus['strength'], 1) if sp_clus else 0.0,
+            'band_width_pct':      round(abs(bw_hi - bw_lo) / live_price * 100, 2),
+            'vix_fit':             round(vf, 1),
+            'confidence_score':    round(0.50 * wr + 0.30 * sr + 0.20 * vf, 1),
+        }
+
+    def _pctile(col, p):
+        if enriched_cycles.empty or col not in enriched_cycles.columns:
+            return 3.0
+        v = enriched_cycles[col].dropna()
+        v = v.abs() if col == 'Max -ve Delta (%)' else v
+        return float(np.percentile(v, p)) if len(v) >= 5 else 3.0
+
+    pu90 = _pctile('Max +ve Delta (%)', 90)
+    pd90 = _pctile('Max -ve Delta (%)', 90)
+    pu95 = _pctile('Max +ve Delta (%)', 95)
+    pd95 = _pctile('Max -ve Delta (%)', 95)
+
+    strats = []
+
+    # ── 1. Short Straddle ─────────────────────────────────────────────────────
+    atm   = _round(live_price)
+    em_up = live_price + expected_move
+    em_dn = live_price - expected_move
+    s1 = _build('Short Straddle', 'straddle', atm, atm, wr_sc=em_up, wr_sp=em_dn)
+    s1['short_call']      = atm          # override: both legs display at ATM
+    s1['short_put']       = atm
+    s1['breakeven_upper'] = _round(em_up)
+    s1['breakeven_lower'] = _round(em_dn)
+    strats.append(s1)
+
+    # ── 2. Strangle — Tight (70% cone, no snap) ───────────────────────────────
+    sc70 = live_price + expected_move * _Z['70%']
+    sp70 = live_price - expected_move * _Z['70%']
+    strats.append(_build('Strangle — Tight (70% Cone)', 'strangle_tight', sc70, sp70))
+
+    # ── 3. Strangle — S/R Aligned (90% cone + nearest S/R) ───────────────────
+    sc90 = live_price + expected_move * _Z['90%']
+    sp90 = live_price - expected_move * _Z['90%']
+    sc90s, sc90c = _snap(sc90, resistance_clusters, 'above')
+    sp90s, sp90c = _snap(sp90, support_clusters,    'below')
+    strats.append(_build(
+        'Strangle — S/R Aligned (90% Cone)', 'strangle_sr',
+        sc90s, sp90s, sc_clus=sc90c, sp_clus=sp90c,
+    ))
+
+    # ── 4. Iron Condor — Standard (90% shorts + 90th-pctile drawdown wings) ──
+    sc4 = _round(sc90s);  sp4 = _round(sp90s)
+    strats.append(_build(
+        'Iron Condor — Standard (90% Cone)', 'ic_standard',
+        sc90s, sp90s,
+        lc_raw=sc4 * (1 + pu90 / 100),
+        lp_raw=sp4 * (1 - pd90 / 100),
+        sc_clus=sc90c, sp_clus=sp90c,
+    ))
+
+    # ── 5. Iron Condor — Conservative (95% shorts + 95th-pctile wings) ────────
+    sc95 = live_price + expected_move * _Z['95%']
+    sp95 = live_price - expected_move * _Z['95%']
+    sc95s, sc95c = _snap(sc95, resistance_clusters, 'above')
+    sp95s, sp95c = _snap(sp95, support_clusters,    'below')
+    sc5 = _round(sc95s);  sp5 = _round(sp95s)
+    strats.append(_build(
+        'Iron Condor — Conservative (95% Cone)', 'ic_conservative',
+        sc95s, sp95s,
+        lc_raw=sc5 * (1 + pu95 / 100),
+        lp_raw=sp5 * (1 - pd95 / 100),
+        sc_clus=sc95c, sp_clus=sp95c,
+    ))
+
+    strats.sort(key=lambda s: s['confidence_score'], reverse=True)
+    for i, s in enumerate(strats):
+        s['rank'] = i + 1
+    return strats

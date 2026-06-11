@@ -41,7 +41,7 @@ The dashboard operates on **two independent time windows** that serve distinct p
 
 Orchestrates UI, data fetching, all quantitative modules, and visualization. Key responsibilities:
 
-- Fetches OHLCV + India VIX data concurrently via `ThreadPoolExecutor(max_workers=2)`
+- Fetches OHLCV + India VIX data **sequentially** via two `load_data()` calls (see Bug History — concurrent fetching caused data cross-contamination)
 - Extracts and enriches expiry cycles
 - Computes real-time probability cone using `live_sigma` (20-day rolling HV) and `effective_days` (BSE calendar trading days to expiry)
 - Calls `compute_sr_levels()` from `trade_logic.py` — passes `enriched_cycles` and `ticker` for expiry-close and round-level sources
@@ -280,6 +280,8 @@ S2 = PP − (High − Low)                 ← Second support
 
 **Weights:** `volume_factor=1.3`, `rejection_quality=0.65` — highest of the "generated" sources, reflecting their widespread use and self-fulfilling nature.
 
+**pandas version compatibility:** The `resample('ME')` frequency alias (Month-End) was introduced in pandas 2.2. Older pandas (≤ 2.1, including Streamlit Cloud's environment) requires `'M'`. The code uses a `try/except ValueError` to fall back automatically — do not change this to a single hard-coded alias.
+
 ---
 
 ### Reclassification Step
@@ -375,28 +377,66 @@ final_strength = base_strength × consol_mult
 After scoring and bonus application:
 - `top_supports`: top 5 support clusters **below current price**, sorted by `strength` descending
 - `top_resistances`: top 5 resistance clusters **above current price**, sorted by `strength` descending
-- All clusters are also returned unfiltered for use in `compute_trade_setup()`
+- All clusters are also returned unfiltered for use in `generate_strategy_recommendations()`
 
 ---
 
-### Trade Setup — `compute_trade_setup()`
+### Trade Setup — `generate_strategy_recommendations()` (replaces `compute_trade_setup`)
 
-**Inputs:** `live_price`, `expected_move` (= `live_price × live_sigma × √(effective_days / 252)`), `enriched_cycles`, `target_conf`, `selected_ticker`, `resistance_clusters`, `support_clusters`
+**Entry point:** `generate_strategy_recommendations(live_price, expected_move, enriched_cycles, selected_ticker, support_clusters, resistance_clusters, current_vix=None)`
 
-**Step 1 — Probability cone bands:**
+Returns a list of 5 strategy dicts, sorted by `confidence_score` descending. Each dict contains:
+
+| Key | Description |
+|---|---|
+| `name` | Display name |
+| `type` | `straddle` / `strangle_tight` / `strangle_sr` / `ic_standard` / `ic_conservative` |
+| `short_call`, `short_put` | Strike prices, rounded to exchange increments |
+| `long_call`, `long_put` | Wing strikes (IC only; `None` for straddle/strangle) |
+| `historical_win_rate` | % of past cycles where `Cycle Return (%)` stayed within the band (0–100) |
+| `sr_score` | S/R confirmation score (0–100); normalized by max cluster strength |
+| `sr_call_confirmed`, `sr_put_confirmed` | Boolean — is the strike within 1.5% of a known S/R cluster? |
+| `sr_call_strength`, `sr_put_strength` | Composite strength of the confirming S/R cluster |
+| `band_width_pct` | `(upper − lower) / live_price × 100` — economic width of the profit zone |
+| `vix_fit` | VIX-regime appropriateness score (0–100) |
+| `confidence_score` | `0.50 × win_rate + 0.30 × sr_score + 0.20 × vix_fit` |
+| `rank` | 1 (best) → 5 |
+| `breakeven_upper/lower` | Straddle only — the ±EM breakeven zone shown to user |
+
+**The 5 fixed strategies:**
+
+| # | Strategy | Construction | Wings |
+|---|---|---|---|
+| — | Short Straddle | Both legs at ATM. WR computed over ±EM breakeven zone. | None |
+| — | Strangle — Tight | 70% cone edges, raw (no S/R snap). Maximum premium, lowest probability. | None |
+| — | Strangle — S/R Aligned | 90% cone snapped to nearest structural S/R within 5%. | None |
+| — | Iron Condor — Standard | Same shorts as Strangle S/R Aligned. Long wings at 90th-pctile of `Max +ve/−ve Delta`. | ✓ |
+| — | Iron Condor — Conservative | 95% cone snapped to S/R. Long wings at 95th-pctile drawdown. | ✓ |
+
+**Historical win rate methodology (critical):**
+
+Uses `Cycle Return (%)` (a percentage relative to each cycle's start open), NOT absolute `Expiry Close` values. This makes win rate **price-level-independent**: valid even when historical NIFTY levels differ significantly from today.
+
 ```
-upper_band = live_price + (expected_move × Z_score)
-lower_band = live_price − (expected_move × Z_score)
+call_pct = (short_call − live_price) / live_price × 100
+put_pct  = (live_price − short_put)  / live_price × 100
+win      = % of cycles where Cycle Return (%) ∈ [−put_pct, +call_pct]
 ```
-Z-scores by confidence: 50% → 0.674, 70% → 1.036, 80% → 1.282, 90% → 1.645, 95% → 1.960, 99% → 2.576
 
-**Step 2 — S/R intersection (2% proximity rule):**
-The code looks for the **strongest** (not nearest) S/R cluster within a 2% window beyond each cone edge. If found, the short strike is placed at that cluster price instead of the raw cone edge. This ensures strikes are placed beyond real structural barriers, not just at a statistical percentile.
+**S/R snap logic:**
 
-**Step 3 — Protective wings:**
-Long wings are placed at the `target_conf` percentile of historical intra-cycle `Max +ve Delta (%)` (for calls) and `Max -ve Delta (%)` (for puts) from the full 5-year cycle history. This makes the Iron Condor width dynamically proportional to how far NIFTY has historically moved within a single cycle at the chosen confidence level.
+`_snap(raw, clusters, side, window=0.05)` — finds the strongest S/R cluster within 5% on the correct side of the raw cone edge. If none found, the raw cone edge is used as-is.
 
-**Step 4 — Strike rounding:**
+**VIX fit heuristics:**
+
+| Strategy | Best VIX range |
+|---|---|
+| Short Straddle | < 14 (quiet market, low premium drain risk) |
+| Strangle Tight | 14–20 (moderate VIX, decent premium) |
+| Strangle S/R / IC Standard | 15–22 (broad applicability) |
+| IC Conservative | > 18 (elevated VIX — premium justifies wider protection cost) |
+
+**Strike rounding (same as before):**
 
 | Ticker | Rounding |
 |---|---|
@@ -408,6 +448,8 @@ Long wings are placed at the `target_conf` percentile of historical intra-cycle 
 | Stocks (500–1000) | Nearest 10 pts |
 | Stocks (1000–2500) | Nearest 20 pts |
 | Stocks (> 2500) | Nearest 50 pts |
+
+**`compute_trade_setup()` is retained** in `trade_logic.py` for reference but is no longer called from `app.py`.
 
 ---
 
@@ -491,7 +533,11 @@ These are computed mathematically from current price without historical touch ev
 | Consolidation candle bonus | ✅ Implemented | `trade_logic.py` |
 | Resistance-turned-support reclassification (all levels reclassified by current price) | ✅ Implemented | `trade_logic.py` |
 | Bollinger Band chart overlay (yellow dotted lines) | ✅ Implemented | `app.py` |
-| Concurrent data fetching (ThreadPoolExecutor) | ✅ Implemented | `app.py` |
+| Sequential data fetching (ThreadPoolExecutor removed — was unsafe with yfinance) | ✅ Fixed | `app.py` |
+| Ranked 5-strategy trade setup (straddle, 2× strangle, 2× iron condor) | ✅ Implemented | `trade_logic.py` + `app.py` |
+| Return-% based historical win rate (price-level-independent) | ✅ Implemented | `trade_logic.py` — `generate_strategy_recommendations` |
+| VIX regime fit scoring per strategy type | ✅ Implemented | `trade_logic.py` — `_vix_fit()` |
+| S/R confirmation tagging on strategy strikes | ✅ Implemented | `trade_logic.py` — `_sr_score()` |
 | Out-of-sample weekly backtest with structural source filter | ✅ Implemented | `backtest_sr.py` |
 | Band-width vs actual-move diagnostic | ✅ Implemented | `backtest_sr.py` |
 | Nearest vs Strongest selection strategies | ✅ Implemented | `backtest_sr.py` |
@@ -509,3 +555,43 @@ These are computed mathematically from current price without historical touch ev
 | **Configurable decay rate (UI)** | Low | `decay_rate` is a parameter of `compute_sr_levels()` but not yet exposed in the `app.py` sidebar. Easy to add if needed |
 | **VIX regime filter** | Medium | In high-VIX trending regimes, S/R levels break more frequently. Adding a VIX threshold gate (e.g., "disable S/R containment expectation when VIX > 20") would improve accuracy metrics during crisis periods |
 | **Put-Call Ratio (PCR)** | Medium | PCR above 1.2 indicates bullish hedging (market expects support); below 0.8 indicates bearish hedging. Not available historically from free sources |
+
+---
+
+## Bug History
+
+Documented root causes for bugs that were non-obvious and hard to rediscover.
+
+### Bug: S/R levels at VIX scale (~12–18) instead of NIFTY scale (~23000–25000)
+
+**Symptom:** After clicking Analyze, R1 and R2 appeared at prices like 18.49 and 16.99. Sources cited `expiry_close`, `swing_high`, `ema_50` — all from what should have been NIFTY data. `avg VIX` shown as ~18, which is a valid VIX value, confirming `sr_vix_data` (NIFTY) and `sr_ticker_data` (VIX) were swapped.
+
+**Root cause:** `yfinance` uses a global HTTP session object internally. When two `yf.download()` calls for different tickers run concurrently in a `ThreadPoolExecutor`, they share session state and can write to each other's download buffers — causing the VIX download result to be returned for the NIFTY request and vice versa. This is a known thread-safety limitation of yfinance's internal architecture.
+
+**Evidence trail:** `enriched_cycles['Expiry Close']` is computed from `ticker_data['Close']`. If `full_ticker_data` (from which `ticker_data` is sliced) contains VIX data, the expiry closes in `enriched_cycles` will be VIX-scale (~17–20 for 2021–2022 VIX). The same data flows into `_detect_swing_levels`, `_detect_ema_bounces`, and `_detect_expiry_levels`, all producing VIX-scale levels. `current_price` (also from `sr_ticker_data['Close'].iloc[-1]`) would be ~12–14 (recent VIX), so 18.49 correctly appears as "resistance" (> current_price).
+
+**Fix (app.py):** Removed `ThreadPoolExecutor`. Data is now fetched sequentially:
+```python
+full_ticker_data = load_data(selected_ticker, False, fetch_start_dt, fetch_end_dt)
+full_vix_data    = load_data('^INDIAVIX',    True,  fetch_start_dt, fetch_end_dt)
+```
+The `@st.cache_data(ttl=3600)` decorator ensures subsequent calls within the TTL window are served from cache — no performance regression for re-runs of the same analysis.
+
+**Do not re-introduce `ThreadPoolExecutor`** for data fetching without first switching yfinance's session to per-thread instances or using `yf.Ticker(...).history(...)` (which creates isolated session objects) instead of the global `yf.download()`.
+
+---
+
+### Bug: `TypeError` on Streamlit Cloud at the `compute_sr_levels(...)` call
+
+**Symptom:** Streamlit Cloud displayed "TypeError: This app has encountered an error" with the traceback pointing to `app.py` line 211 — the `compute_sr_levels(...)` call. The original error message was redacted by Streamlit.
+
+**Root cause:** `_detect_monthly_pivots()` in `trade_logic.py` used `sr_ticker_data.resample('ME')`. The `'ME'` (Month-End) frequency alias was introduced in pandas 2.2.0. Streamlit Cloud's environment runs an older pandas version (≤ 2.1) where `'ME'` raises `ValueError: Invalid frequency: ME`. Streamlit wraps this as a generic `TypeError` in its error UI, hiding the real exception type.
+
+**Fix (trade_logic.py):** Added a `try/except ValueError` fallback:
+```python
+try:
+    monthly = sr_ticker_data.resample('ME').agg(...)
+except ValueError:
+    monthly = sr_ticker_data.resample('M').agg(...)
+```
+Both `'ME'` and `'M'` produce identical month-end resampling. `'M'` is deprecated in pandas 2.2 (FutureWarning) but not yet removed. The try/except ensures compatibility with both old and new pandas versions without requiring a pinned dependency.

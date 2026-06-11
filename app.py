@@ -11,7 +11,7 @@ from data_collection import get_nifty50_tickers, get_indices_tickers, fetch_hist
 from expiry_logic import extract_expiry_cycles, get_valid_trading_days
 from metrics import enrich_cycles_with_metrics
 from news_fetcher import fetch_extreme_move_news
-from trade_logic import compute_sr_levels, compute_trade_setup
+from trade_logic import compute_sr_levels, generate_strategy_recommendations
 
 st.set_page_config(page_title="Historical Expiry Dashboard", layout="wide", page_icon="📈")
 
@@ -198,7 +198,12 @@ if st.session_state.analyze_triggered:
         # --- Support & Resistance Logic ---
         st.markdown("---")
         st.subheader("🧱 Support & Resistance Analysis")
-        
+
+        # Initialized here so trade setup below always has valid references
+        # even when the S/R window has insufficient data
+        support_clusters    = []
+        resistance_clusters = []
+
         # 1. Multi-Source S/R Identification
         sr_ticker_data = full_ticker_data[(full_ticker_data.index >= sr_start_dt) & (full_ticker_data.index <= sr_end_dt)].copy()
         sr_vix_data = full_vix_data[(full_vix_data.index >= sr_start_dt) & (full_vix_data.index <= sr_end_dt)].copy()
@@ -334,39 +339,103 @@ if st.session_state.analyze_triggered:
 
         st.markdown("---")
 
-        # --- Mechanical Trade Setup ---
-        st.markdown("---")
-        # Define trade setup parameters globally usable if active cycle exists
-        confidence_levels = ["70%", "80%", "90%", "95%", "99%"]
-        
-        col_ts_title, col_ts_conf = st.columns([3, 1])
-        with col_ts_title:
-            st.subheader("🤖 Algorithmic Trade Setup")
-        with col_ts_conf:
-            target_conf = st.selectbox("Target Confidence Level", confidence_levels, index=2) # Default 90%
-            
+        # --- Algorithmic Trade Setup ---
+        st.subheader("🤖 Algorithmic Trade Setup")
+        st.markdown(
+            "Ranked strategy recommendations. Each is scored on **historical win rate** "
+            "(how often past cycles stayed within the band), **S/R confirmation** "
+            "(whether strikes sit on structural levels), and **VIX regime fit**."
+        )
+
+        current_vix_val = full_vix_data['Close'].iloc[-1] if not full_vix_data.empty else None
+
         if not active_cycles.empty and not np.isnan(live_sigma):
+            em_pct = expected_move / live_price * 100
+
+            col_ctx1, col_ctx2, col_ctx3, col_ctx4 = st.columns(4)
+            with col_ctx1:
+                st.metric("Live Price", f"₹{live_price:,.0f}")
+            with col_ctx2:
+                st.metric("Expected Move", f"±{expected_move:,.0f} pts", delta=f"±{em_pct:.1f}%", delta_color="off")
+            with col_ctx3:
+                st.metric("India VIX", f"{current_vix_val:.1f}" if current_vix_val is not None else "—")
+            with col_ctx4:
+                st.metric("Cycles Analyzed", len(enriched_cycles))
+
             try:
-                # Compute trade strikes via trade_logic module
-                final_short_call, final_short_put, final_long_call, final_long_put = compute_trade_setup(
+                strategies = generate_strategy_recommendations(
                     live_price, expected_move, enriched_cycles,
-                    target_conf, selected_ticker,
-                    resistance_clusters, support_clusters
+                    selected_ticker, support_clusters, resistance_clusters,
+                    current_vix=current_vix_val,
                 )
-                
-                col_ss, col_ic = st.columns(2)
-                
-                with col_ss:
-                    st.markdown(f"### 📉 Short Strangle (`{target_conf}` Confidence)")
-                    st.info(f"**Short Call:** {final_short_call:,.0f} CE\n\n**Short Put:** {final_short_put:,.0f} PE")
-                    
-                with col_ic:
-                    st.markdown(f"### 🦅 Iron Condor (`{target_conf}` Confidence)")
-                    st.success(f"**Long Call Wing:** {final_long_call:,.0f} CE\n\n**Short Call:** {final_short_call:,.0f} CE\n\n**Short Put:** {final_short_put:,.0f} PE\n\n**Long Put Wing:** {final_long_put:,.0f} PE")
-                
-                st.caption("*Short strikes are placed outside both the selected statistical probability cone and the nearest structural S/R zones. Long protective wings are placed outside the corresponding percentile of historical intra-cycle drawdowns.*")
+
+                _TYPE_ICON = {
+                    'straddle':        '⚖️',
+                    'strangle_tight':  '📐',
+                    'strangle_sr':     '🎯',
+                    'ic_standard':     '🦅',
+                    'ic_conservative': '🛡️',
+                }
+                _RANK_MEDAL = ['🥇', '🥈', '🥉', '#4', '#5']
+
+                for s in strategies:
+                    medal = _RANK_MEDAL[s['rank'] - 1]
+                    icon  = _TYPE_ICON.get(s['type'], '📊')
+                    conf  = s['confidence_score']
+
+                    with st.expander(
+                        f"{medal}  **{s['name']}** {icon}  —  Confidence: **{conf:.1f} / 100**",
+                        expanded=(s['rank'] <= 2),
+                    ):
+                        col_str, col_score, col_meta = st.columns([2, 2, 1])
+
+                        with col_str:
+                            st.markdown("**Strike Configuration**")
+                            if s['type'] == 'straddle':
+                                st.write(f"Short (Both Legs): **{s['short_call']:,}** (ATM)")
+                                bu = s.get('breakeven_upper', 0)
+                                bl = s.get('breakeven_lower', 0)
+                                st.write(f"Breakeven zone: _{bl:,}_ — _{bu:,}_")
+                                st.caption("Sell both ATM call + put at the same strike. Profitable while price stays within breakeven range.")
+                            else:
+                                c_tag = " ✅ *S/R*" if s['sr_call_confirmed'] else ""
+                                p_tag = " ✅ *S/R*" if s['sr_put_confirmed'] else ""
+                                st.write(f"Short Call: **{s['short_call']:,} CE**{c_tag}")
+                                st.write(f"Short Put:  **{s['short_put']:,} PE**{p_tag}")
+                                if s['long_call'] is not None:
+                                    st.write(f"Long Call Wing: {s['long_call']:,} CE")
+                                    st.write(f"Long Put Wing:  {s['long_put']:,} PE")
+                                if s['sr_call_confirmed'] or s['sr_put_confirmed']:
+                                    parts = []
+                                    if s['sr_call_confirmed']:
+                                        parts.append(f"Call anchored to S/R (strength {s['sr_call_strength']:.1f})")
+                                    if s['sr_put_confirmed']:
+                                        parts.append(f"Put anchored to S/R (strength {s['sr_put_strength']:.1f})")
+                                    st.caption(" · ".join(parts))
+
+                        with col_score:
+                            st.markdown("**Scoring Breakdown**")
+                            st.write(f"📊 Historical Win Rate *(50% wt)*: **{s['historical_win_rate']:.1f}%**")
+                            st.progress(min(s['historical_win_rate'] / 100, 1.0))
+                            st.write(f"🧱 S/R Confirmation *(30% wt)*:   **{s['sr_score']:.1f}%**")
+                            st.progress(min(s['sr_score'] / 100, 1.0))
+                            st.write(f"📈 VIX Regime Fit *(20% wt)*:     **{s['vix_fit']:.1f}%**")
+                            st.progress(min(s['vix_fit'] / 100, 1.0))
+
+                        with col_meta:
+                            st.metric("Band Width", f"{s['band_width_pct']:.1f}%",
+                                      help="(Short call − short put) ÷ live price. Wider = lower max-profit probability but more buffer.")
+                            st.metric("Confidence", f"{conf:.1f}/100")
+
+                st.caption(
+                    "_Win rate is computed over all historical cycles using **return-% offsets** from live price "
+                    "(not absolute prices), so it remains valid even when NIFTY was at different levels historically. "
+                    "S/R ✅ means the short strike falls within 1.5% of a known structural cluster detected by the S/R engine. "
+                    "VIX fit reflects how suitable the strategy type is for the current India VIX reading._"
+                )
+
             except Exception as e:
-                st.error(f"Error calculating trade setup: {e}")
+                st.error(f"Error generating strategy recommendations: {e}")
 
         else:
             st.info("Algorithmic Trade Setup requires an active expiry cycle with computable live volatility bounds.")
